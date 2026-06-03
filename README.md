@@ -1,7 +1,8 @@
 # agentmail-to-claude-code
 
 Email gateway for [Claude Code](https://claude.com/claude-code). Subscribe an
-[AgentMail](https://agentmail.to) inbox over WebSocket; on every authenticated,
+[AgentMail](https://agentmail.to) inbox over WebSocket, or poll a
+[Primitive](https://primitive.dev) inbox over REST; on every authenticated,
 allowlisted message the daemon opens a fresh Claude Code session in your
 terminal, writes the email to a prompt file, and tells Claude to read and act
 on it.
@@ -23,8 +24,10 @@ Pick one with `CC_TERMINAL` in your env.
 
 ## How it works
 
-1. `cc-daemon.py` connects to AgentMail's WebSocket and subscribes to `AGENTMAIL_INBOX`.
-2. On `MessageReceivedEvent`, the handler drops any message whose sender isn't in `CC_ALLOWED_FROM` or that failed DKIM/SPF.
+1. `cc-daemon.py` connects to the selected provider:
+   - `CC_MAIL_PROVIDER=agentmail` subscribes to AgentMail's WebSocket for `AGENTMAIL_INBOX`.
+   - `CC_MAIL_PROVIDER=primitive` polls Primitive for `PRIMITIVE_INBOX`.
+2. On each incoming message, the handler drops anything whose sender isn't in `CC_ALLOWED_FROM` or that failed DKIM/SPF.
 3. Attachments are downloaded under `CC_HOME/attachments/<message-id>/`. Per-attachment failures log a warning and continue.
 4. A prompt is built from `From:`, `Subject:`, the body, and a footer listing every downloaded attachment by absolute path. It's written to `CC_HOME/prompts/<message-id>.md`.
 5. The selected backend opens a new Claude Code session and sends a single-line pointer telling Claude to read and act on the prompt file:
@@ -38,7 +41,9 @@ The email is referenced by file path rather than typed inline, which keeps multi
 
 - macOS (AppleScript, launchd)
 - Python 3.12+
-- An [AgentMail](https://agentmail.to) account with an inbox-scoped API key
+- Either:
+  - an [AgentMail](https://agentmail.to) account with an inbox-scoped API key, or
+  - a [Primitive](https://primitive.dev) account with a receiving domain and API token
 - One of:
   - **cmux** installed, or
   - **Ghostty** installed
@@ -53,14 +58,32 @@ python3 -m venv venv
 ./venv/bin/pip install agentmail httpx pytest
 
 cp cc.env.example cc.env
-$EDITOR cc.env   # fill in AGENTMAIL_API_KEY, AGENTMAIL_INBOX, CC_ALLOWED_FROM, CC_TERMINAL
+$EDITOR cc.env   # fill in provider credentials, inbox, CC_ALLOWED_FROM, CC_TERMINAL
 chmod 600 cc.env
 
-# Verify it subscribes
+# Verify it connects to the selected provider
 ./run-daemon.sh
 ```
 
 `CC_ALLOWED_FROM` is the gate on who can drive your machine. Keep it to addresses you control. Mail from anyone else, or anything that fails DKIM/SPF, is dropped before a session is ever opened.
+
+### Primitive backend
+
+Primitive does not require provisioning each role inbox. After your Primitive
+domain is receiving, any local-part at that domain can receive mail, so you can
+use readable addresses like `taskcodex@your-domain.primitive.email` or
+`calendar@your-domain.primitive.email`.
+
+```bash
+export CC_MAIL_PROVIDER=primitive
+export PRIMITIVE_AUTH_TOKEN=your-primitive-bearer-token
+export PRIMITIVE_INBOX=taskcodex@your-domain.primitive.email
+```
+
+The Primitive backend polls recent `completed` and `accepted` messages, stores
+processed IDs in `CC_HOME/state.json`, and uses the same allowlist,
+authentication check, attachment download, and terminal dispatch flow as the
+AgentMail backend.
 
 ## Choose your terminal
 
@@ -151,6 +174,18 @@ image is attached as base64 that's read and encoded in-process, so when an agent
 shells out to this script the raw image bytes never pass through its LLM context
 (the agent passes a file path, not the pixels). Both the API key and the sending
 inbox come from the environment; nothing is hardcoded.
+
+With Primitive, you can send through the Primitive CLI or API. The sender still
+has to be listed in `CC_ALLOWED_FROM`:
+
+```bash
+primitive send \
+  --from agent@your-domain.primitive.email \
+  --to taskcodex@your-domain.primitive.email \
+  --subject "Resize these" \
+  --body "Crop to 1:1" \
+  --wait
+```
 
 ### How I use it with Hermes
 

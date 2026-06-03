@@ -6,8 +6,10 @@ The daemon file has a hyphen in its name, so we load it via importlib.
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
 import pathlib
+import tarfile
 import tempfile
 
 import pytest
@@ -75,6 +77,61 @@ def test_build_prompt_lists_attachment_paths():
     p = daemon.build_prompt("a@example.com", "subj", "body", atts)
     assert "/tmp/a.png" in p
     assert "use the Read tool" in p
+
+
+# --- Primitive helpers -------------------------------------------------------
+
+
+def test_primitive_auth_uses_analysis_then_auth_fallback():
+    assert daemon.primitive_is_authenticated({"analysis": {"sender": {"authenticated": True}}})
+    assert not daemon.primitive_is_authenticated({"analysis": {"sender": {"authenticated": False}}, "auth": {"dmarc": "pass"}})
+    assert daemon.primitive_is_authenticated({"auth": {"dmarc": "pass"}})
+    assert daemon.primitive_is_authenticated({"auth": {"dkimSignatures": [{"result": "pass", "aligned": True}]}})
+    assert not daemon.primitive_is_authenticated({"auth": {"dmarc": "fail", "dkimSignatures": []}})
+
+
+def test_primitive_list_candidate_summaries_queries_each_status(monkeypatch):
+    calls = []
+
+    def fake_request(_method, _path, *, params=None, payload=None):
+        calls.append(params)
+        return {"data": [{"id": f"em_{params['status']}"}]}
+
+    monkeypatch.setattr(daemon, "INBOX", "task@primitive.email")
+    monkeypatch.setattr(daemon, "PRIMITIVE_EMAIL_STATUSES", ["completed", "accepted"])
+    monkeypatch.setattr(daemon, "primitive_request_json", fake_request)
+    assert [item["id"] for item in daemon.primitive_list_candidate_summaries()] == [
+        "em_completed",
+        "em_accepted",
+    ]
+    assert calls == [
+        {"to": "task@primitive.email", "status": "completed", "limit": daemon.PRIMITIVE_POLL_LIMIT},
+        {"to": "task@primitive.email", "status": "accepted", "limit": daemon.PRIMITIVE_POLL_LIMIT},
+    ]
+
+
+def test_primitive_download_attachments_extracts_safe_members(monkeypatch, tmp_path):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as archive:
+        data = b"hello"
+        good = tarfile.TarInfo("0_note.txt")
+        good.size = len(data)
+        archive.addfile(good, io.BytesIO(data))
+        bad = tarfile.TarInfo("../escape.txt")
+        bad.size = len(data)
+        archive.addfile(bad, io.BytesIO(data))
+
+    monkeypatch.setattr(daemon, "ATTACHMENT_ROOT", tmp_path)
+    monkeypatch.setattr(daemon, "primitive_request_bytes", lambda _path: buf.getvalue())
+    detail = {
+        "id": "em_tar",
+        "parsed": {
+            "attachments": [{"filename": "note.txt", "content_type": "text/plain", "size_bytes": 5}]
+        },
+    }
+    saved = daemon.primitive_download_attachments(detail)
+    assert len(saved) == 1
+    assert pathlib.Path(saved[0]["path"]).read_text() == "hello"
 
 
 # --- cmux RPC helper ---------------------------------------------------------
@@ -277,3 +334,37 @@ def test_handle_leaves_unread_and_replies_on_failure(monkeypatch, tmp_path):
     # not marked read; a failure reply was bounced back instead.
     assert not client.inboxes.messages.updated
     assert client.inboxes.messages.replied
+
+
+def _primitive_detail():
+    return {
+        "id": "em_primitive",
+        "from_header": "Allowed <a@example.com>",
+        "from_email": "a@example.com",
+        "subject": "do a primitive thing",
+        "body_text": "body",
+        "status": "completed",
+        "analysis": {"sender": {"authenticated": True}},
+        "parsed": {"attachments": []},
+    }
+
+
+def test_handle_primitive_email_success_marks_processed(monkeypatch):
+    state = {"processed": []}
+    monkeypatch.setattr(daemon, "ALLOWED_FROM", {"a@example.com"})
+    monkeypatch.setattr(daemon, "primitive_download_attachments", lambda _detail: [])
+    monkeypatch.setattr(daemon, "dispatch_to_claude_code", lambda *a: True)
+    daemon.handle_primitive_email(_primitive_detail(), state)
+    assert state["processed"] == ["em_primitive"]
+
+
+def test_handle_primitive_email_failure_replies_once_and_marks_processed(monkeypatch):
+    state = {"processed": []}
+    replies = []
+    monkeypatch.setattr(daemon, "ALLOWED_FROM", {"a@example.com"})
+    monkeypatch.setattr(daemon, "primitive_download_attachments", lambda _detail: [])
+    monkeypatch.setattr(daemon, "dispatch_to_claude_code", lambda *a: False)
+    monkeypatch.setattr(daemon, "primitive_reply_failure", lambda detail, subject: replies.append((detail["id"], subject)))
+    daemon.handle_primitive_email(_primitive_detail(), state)
+    assert replies == [("em_primitive", "do a primitive thing")]
+    assert state["processed"] == ["em_primitive"]

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""AgentMail -> Claude Code daemon.
+"""Email -> Claude Code daemon.
 
-Subscribes to an AgentMail inbox over WebSocket. On every authenticated,
-allowlisted message it opens a new Claude Code session in your terminal
-(standalone Ghostty or cmux), writes the email to a prompt file, and tells
-Claude to read and act on it.
+Subscribes to an AgentMail inbox over WebSocket or polls a Primitive inbox over
+REST. On every authenticated, allowlisted message it opens a new Claude Code
+session in your terminal (standalone Ghostty or cmux), writes the email to a
+prompt file, and tells Claude to read and act on it.
 
 Configuration is entirely via environment variables (see cc.env.example):
+  CC_MAIL_PROVIDER     "agentmail" (default) or "primitive"
   AGENTMAIL_API_KEY   AgentMail inbox-scoped API key
   AGENTMAIL_INBOX     the inbox to watch, e.g. you@agentmail.to
+  PRIMITIVE_AUTH_TOKEN Primitive bearer token (or set PRIMITIVE_API_KEY)
+  PRIMITIVE_INBOX     Primitive address to watch
   CC_TERMINAL         "cmux" (default) or "ghostty"
   CC_ALLOWED_FROM     comma-separated sender allowlist
   CMUX_BIN            absolute path to the cmux CLI (cmux backend only)
@@ -18,20 +21,31 @@ Configuration is entirely via environment variables (see cc.env.example):
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import os
 import pathlib
 import re
 import subprocess
+import tarfile
 import time
+import urllib.parse
 
 import httpx
-from agentmail import AgentMail, MessageReceivedEvent, Subscribe, Subscribed
+
+try:
+    from agentmail import AgentMail, MessageReceivedEvent, Subscribe, Subscribed
+except ImportError:  # Primitive-only installs do not need the AgentMail SDK.
+    AgentMail = MessageReceivedEvent = Subscribe = Subscribed = None
 
 # --- configuration -----------------------------------------------------------
 
-INBOX = os.environ["AGENTMAIL_INBOX"]
+MAIL_PROVIDER = os.environ.get("CC_MAIL_PROVIDER", "agentmail").strip().lower()
+if MAIL_PROVIDER == "primitive":
+    INBOX = os.environ["PRIMITIVE_INBOX"]
+else:
+    INBOX = os.environ["AGENTMAIL_INBOX"]
 
 # Which terminal to drive a new Claude Code session in.
 TERMINAL = os.environ.get("CC_TERMINAL", "cmux").strip().lower()
@@ -50,6 +64,7 @@ CC_HOME = pathlib.Path(
 ATTACHMENT_ROOT = CC_HOME / "attachments"
 PROMPT_ROOT = CC_HOME / "prompts"
 LOG_PATH = CC_HOME / "dispatch.log"
+STATE_PATH = CC_HOME / "state.json"
 CC_HOME.mkdir(parents=True, exist_ok=True)
 
 # cmux backend: the daemon shells out to the cmux CLI by absolute path because
@@ -65,6 +80,26 @@ CLAUDE_READY_TIMEOUT_S = int(os.environ.get("CC_READY_TIMEOUT", "25"))
 # few times with backoff before giving up so a flaky cmux self-heals.
 SURFACE_CREATE_ATTEMPTS = int(os.environ.get("CC_SURFACE_CREATE_ATTEMPTS", "4"))
 SURFACE_CREATE_BACKOFF_S = int(os.environ.get("CC_SURFACE_CREATE_BACKOFF", "3"))
+
+# Primitive backend: Primitive does not require provisioning individual inboxes.
+# Any local part at your Primitive domain can receive mail, so this daemon polls
+# the configured address and keeps local processed state.
+PRIMITIVE_API_BASE = os.environ.get(
+    "PRIMITIVE_API_BASE", "https://api.primitive.dev/v1"
+).rstrip("/")
+PRIMITIVE_AUTH_TOKEN = (
+    os.environ.get("PRIMITIVE_AUTH_TOKEN") or os.environ.get("PRIMITIVE_API_KEY")
+)
+PRIMITIVE_POLL_INTERVAL_S = int(os.environ.get("PRIMITIVE_POLL_INTERVAL", "15"))
+PRIMITIVE_POLL_LIMIT = int(os.environ.get("PRIMITIVE_POLL_LIMIT", "25"))
+PRIMITIVE_EMAIL_STATUSES = [
+    value.strip()
+    for value in os.environ.get("PRIMITIVE_EMAIL_STATUSES", "completed,accepted").split(",")
+    if value.strip()
+]
+PRIMITIVE_HTTP_USER_AGENT = os.environ.get(
+    "PRIMITIVE_HTTP_USER_AGENT", "agentmail-to-claude-code/primitive"
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -97,6 +132,167 @@ def format_size(n: int) -> str:
     if n < 1024 * 1024:
         return f"{n / 1024:.1f} KB"
     return f"{n / (1024 * 1024):.1f} MB"
+
+
+def load_state() -> dict:
+    if not STATE_PATH.exists():
+        return {"processed": []}
+    try:
+        state = json.loads(STATE_PATH.read_text())
+    except Exception:
+        log.warning("state file unreadable; starting fresh: %s", STATE_PATH)
+        return {"processed": []}
+    state.setdefault("processed", [])
+    return state
+
+
+def save_state(state: dict) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+    tmp.replace(STATE_PATH)
+
+
+def mark_processed(state: dict, email_id: str) -> None:
+    processed = state.setdefault("processed", [])
+    if email_id not in processed:
+        processed.append(email_id)
+        if len(processed) > 2000:
+            del processed[:-2000]
+
+
+def primitive_headers() -> dict:
+    if not PRIMITIVE_AUTH_TOKEN:
+        raise RuntimeError("set PRIMITIVE_AUTH_TOKEN or PRIMITIVE_API_KEY")
+    return {
+        "Authorization": f"Bearer {PRIMITIVE_AUTH_TOKEN}",
+        "User-Agent": PRIMITIVE_HTTP_USER_AGENT,
+    }
+
+
+def primitive_request_json(
+    method: str,
+    path: str,
+    *,
+    params: dict | None = None,
+    payload: dict | None = None,
+) -> dict:
+    headers = primitive_headers()
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    resp = httpx.request(
+        method,
+        f"{PRIMITIVE_API_BASE}{path}",
+        headers=headers,
+        params=params,
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def primitive_request_bytes(path: str) -> bytes:
+    resp = httpx.get(
+        f"{PRIMITIVE_API_BASE}{path}",
+        headers=primitive_headers(),
+        timeout=60,
+        follow_redirects=True,
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
+def primitive_list_candidate_summaries() -> list[dict]:
+    seen = set()
+    out = []
+    for status in PRIMITIVE_EMAIL_STATUSES:
+        result = primitive_request_json(
+            "GET",
+            "/emails/search",
+            params={"to": INBOX, "status": status, "limit": PRIMITIVE_POLL_LIMIT},
+        )
+        for item in result.get("data", []):
+            email_id = item.get("id")
+            if email_id and email_id not in seen:
+                seen.add(email_id)
+                out.append(item)
+    return out
+
+
+def primitive_get_email_detail(email_id: str) -> dict:
+    quoted = urllib.parse.quote(email_id, safe="")
+    result = primitive_request_json("GET", f"/emails/{quoted}")
+    return result.get("data") or result
+
+
+def primitive_is_authenticated(detail: dict) -> bool:
+    analysis = detail.get("analysis") or {}
+    sender = analysis.get("sender") or {}
+    if "authenticated" in sender:
+        return bool(sender.get("authenticated"))
+    auth = detail.get("auth") or {}
+    if str(auth.get("dmarc", "")).lower() == "pass":
+        return True
+    for sig in auth.get("dkimSignatures", []) or []:
+        if str(sig.get("result", "")).lower() == "pass" and sig.get("aligned"):
+            return True
+    return False
+
+
+def primitive_sender(detail: dict) -> str:
+    return parse_from(
+        detail.get("from_email") or detail.get("from_header") or detail.get("from") or ""
+    )
+
+
+def _safe_extract_member(dest: pathlib.Path, member: tarfile.TarInfo) -> pathlib.Path | None:
+    if not member.isfile():
+        return None
+    member_path = pathlib.PurePosixPath(member.name)
+    if member_path.is_absolute() or ".." in member_path.parts:
+        log.warning("skipping unsafe attachment path id=%s path=%r", dest.name, member.name)
+        return None
+    target = dest / safe_name(member_path.name)
+    if not str(target.resolve()).startswith(str(dest.resolve())):
+        log.warning("skipping unsafe attachment path id=%s path=%r", dest.name, member.name)
+        return None
+    return target
+
+
+def primitive_download_attachments(detail: dict) -> list[dict]:
+    attachments = list((detail.get("parsed") or {}).get("attachments") or [])
+    if not attachments:
+        return []
+    email_id = detail.get("id") or "primitive-email"
+    dest = ATTACHMENT_ROOT / safe_name(email_id)
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        data = primitive_request_bytes(
+            f"/emails/{urllib.parse.quote(email_id, safe='')}/attachments/download"
+        )
+    except Exception as e:
+        log.warning("attachment bundle download failed id=%s err=%s", email_id, e)
+        return []
+
+    saved = []
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
+        for index, member in enumerate(archive.getmembers()):
+            target = _safe_extract_member(dest, member)
+            if target is None:
+                continue
+            src = archive.extractfile(member)
+            if src is None:
+                continue
+            target.write_bytes(src.read())
+            meta = attachments[index] if index < len(attachments) else {}
+            saved.append({
+                "path": str(target),
+                "filename": meta.get("filename") or target.name,
+                "content_type": meta.get("content_type"),
+                "size": meta.get("size_bytes") or target.stat().st_size,
+            })
+    return saved
 
 
 def download_attachments(client: AgentMail, msg) -> list[dict]:
@@ -367,12 +563,103 @@ def handle_message(client: AgentMail, ev: MessageReceivedEvent) -> None:
         log.warning("mark-read skipped: %s", e)
 
 
-def main() -> None:
-    if not ALLOWED_FROM:
-        log.warning("CC_ALLOWED_FROM is empty - every message will be dropped. "
-                    "Set it in cc.env.")
+def primitive_reply_failure(detail: dict, subject: str) -> None:
+    email_id = detail.get("id")
+    if not email_id:
+        return
+    try:
+        primitive_request_json(
+            "POST",
+            f"/emails/{urllib.parse.quote(email_id, safe='')}/reply",
+            payload={
+                "body_text": (
+                    f"Could not dispatch '{subject}' to your terminal "
+                    f"(CC_TERMINAL={TERMINAL}). The task was marked handled "
+                    f"locally to avoid repeated failure replies; resend once "
+                    f"the terminal is reachable."
+                )
+            },
+        )
+    except Exception as e:
+        log.warning("failure-reply skipped: %s", e)
+
+
+def handle_primitive_email(detail: dict, state: dict) -> None:
+    email_id = detail.get("id")
+    if not email_id:
+        return
+    raw_from = detail.get("from_header") or detail.get("from_email") or ""
+    sender = primitive_sender(detail)
+    subject = (detail.get("subject") or "(no subject)").strip()
+    text = (detail.get("body_text") or detail.get("text") or "").strip()
+    log.info("recv id=%s from=%s subj=%r status=%s", email_id, sender, subject, detail.get("status"))
+
+    if sender not in ALLOWED_FROM:
+        log.info("DROP sender-not-allowed id=%s sender=%s", email_id, sender)
+        mark_processed(state, email_id)
+        return
+    if not primitive_is_authenticated(detail):
+        log.info("DROP not-authenticated id=%s sender=%s auth=%s", email_id, sender, detail.get("auth"))
+        mark_processed(state, email_id)
+        return
+
+    saved = primitive_download_attachments(detail)
+    if saved:
+        log.info("attachments saved=%d for %s", len(saved), sender)
+    prompt = build_prompt(raw_from, subject, text, saved)
+    ok = dispatch_to_claude_code(prompt, sender, email_id)
+
+    if ok:
+        mark_processed(state, email_id)
+        return
+
+    log.error(
+        "dispatch FAILED; marking processed after failure reply sender=%s subj=%r msg=%s",
+        sender, subject, email_id,
+    )
+    primitive_reply_failure(detail, subject)
+    mark_processed(state, email_id)
+
+
+def primitive_poll_once(state: dict) -> int:
+    processed = set(state.get("processed", []))
+    handled = 0
+    for summary in reversed(primitive_list_candidate_summaries()):
+        email_id = summary.get("id")
+        if not email_id or email_id in processed:
+            continue
+        try:
+            detail = primitive_get_email_detail(email_id)
+            handle_primitive_email(detail, state)
+            handled += 1
+        except Exception:
+            log.exception("handler crashed id=%s", email_id)
+        finally:
+            save_state(state)
+    return handled
+
+
+def run_primitive_loop() -> None:
+    state = load_state()
     log.info(
-        "starting cc-mail daemon inbox=%s terminal=%s allowed=%s",
+        "starting cc-mail daemon provider=primitive inbox=%s terminal=%s allowed=%s statuses=%s",
+        INBOX, TERMINAL, sorted(ALLOWED_FROM), PRIMITIVE_EMAIL_STATUSES,
+    )
+    while True:
+        try:
+            count = primitive_poll_once(state)
+            if count:
+                log.info("poll handled=%d", count)
+        except Exception:
+            log.exception("poll loop crashed")
+        time.sleep(PRIMITIVE_POLL_INTERVAL_S)
+
+
+def run_agentmail_loop() -> None:
+    if AgentMail is None:
+        raise RuntimeError("install the agentmail package or set CC_MAIL_PROVIDER=primitive")
+    log.info(
+        "starting cc-mail daemon provider=agentmail inbox=%s terminal=%s allowed=%s",
         INBOX, TERMINAL, sorted(ALLOWED_FROM),
     )
     while True:
@@ -391,6 +678,18 @@ def main() -> None:
         except Exception:
             log.exception("WS loop crashed, reconnecting in 5s")
             time.sleep(5)
+
+
+def main() -> None:
+    if not ALLOWED_FROM:
+        log.warning("CC_ALLOWED_FROM is empty - every message will be dropped. "
+                    "Set it in cc.env.")
+    if MAIL_PROVIDER == "primitive":
+        run_primitive_loop()
+    elif MAIL_PROVIDER == "agentmail":
+        run_agentmail_loop()
+    else:
+        raise RuntimeError("CC_MAIL_PROVIDER must be 'agentmail' or 'primitive'")
 
 
 if __name__ == "__main__":
