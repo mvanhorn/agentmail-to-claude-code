@@ -6,8 +6,10 @@ The daemon file has a hyphen in its name, so we load it via importlib.
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
 import pathlib
+import tarfile
 import tempfile
 
 import pytest
@@ -38,6 +40,22 @@ def test_allowlist_parsed_and_lowercased():
     assert daemon.ALLOWED_FROM == {"alice@example.com", "bob@example.com"}
 
 
+def test_primitive_provider_loads_without_agentmail_env(monkeypatch):
+    monkeypatch.setenv("CC_MAIL_PROVIDER", "primitive")
+    monkeypatch.setenv("PRIMITIVE_INBOX", "bot@org.primitive.email")
+    monkeypatch.setenv("PRIMITIVE_AUTH_TOKEN", "prim_test")
+    monkeypatch.setenv("CC_HOME", tempfile.mkdtemp(prefix="primitive-cc-home-"))
+    monkeypatch.delenv("AGENTMAIL_INBOX", raising=False)
+    spec = importlib.util.spec_from_file_location(
+        "cc_daemon_primitive",
+        pathlib.Path(__file__).parent / "cc-daemon.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.MAIL_PROVIDER == "primitive"
+    assert mod.INBOX == "bot@org.primitive.email"
+
+
 def test_safe_name_strips_message_id_angle_brackets():
     out = daemon.safe_name("<mp8w1w77.8dd87270@example.com>")
     assert out == "mp8w1w77.8dd87270_example.com"
@@ -57,6 +75,24 @@ def test_format_size_units():
 def test_parse_from_extracts_angle_addr():
     assert daemon.parse_from("Alice <ALICE@Example.com>") == "alice@example.com"
     assert daemon.parse_from("bob@example.com") == "bob@example.com"
+
+
+def test_primitive_auth_uses_analysis_when_present():
+    assert daemon.primitive_is_authenticated({"analysis": {"sender": {"authenticated": True}}})
+    assert not daemon.primitive_is_authenticated({
+        "analysis": {"sender": {"authenticated": False}},
+        "auth": {"dmarc": "pass"},
+    })
+
+
+def test_primitive_auth_falls_back_to_dmarc_and_aligned_dkim():
+    assert daemon.primitive_is_authenticated({"auth": {"dmarc": "pass"}})
+    assert daemon.primitive_is_authenticated({
+        "auth": {"dkimSignatures": [{"result": "pass", "aligned": True}]}
+    })
+    assert not daemon.primitive_is_authenticated({
+        "auth": {"dmarc": "fail", "dkimSignatures": []}
+    })
 
 
 # --- build_prompt ------------------------------------------------------------
@@ -277,3 +313,89 @@ def test_handle_leaves_unread_and_replies_on_failure(monkeypatch, tmp_path):
     # not marked read; a failure reply was bounced back instead.
     assert not client.inboxes.messages.updated
     assert client.inboxes.messages.replied
+
+
+# --- Primitive provider ------------------------------------------------------
+
+
+def test_primitive_list_candidate_summaries_dedupes_and_sorts(monkeypatch):
+    calls = []
+
+    def fake_request(method, path, *, params=None, payload=None):
+        calls.append(params)
+        if params["status"] == "completed":
+            return {
+                "data": [
+                    {"id": "older", "received_at": "2026-01-01T00:00:00Z"},
+                    {"id": "newer", "received_at": "2026-01-03T00:00:00Z"},
+                ],
+                "meta": {"cursor": None},
+            }
+        return {
+            "data": [{"id": "middle", "received_at": "2026-01-02T00:00:00Z"}],
+            "meta": {"cursor": None},
+        }
+
+    monkeypatch.setattr(daemon, "PRIMITIVE_EMAIL_STATUSES", ["completed", "accepted"])
+    monkeypatch.setattr(daemon, "primitive_request_json", fake_request)
+    out = daemon.primitive_list_candidate_summaries()
+    assert [x["id"] for x in out] == ["newer", "middle", "older"]
+    assert all(call["to"] == daemon.INBOX for call in calls)
+
+
+def test_primitive_download_attachments_extracts_safe_members(monkeypatch, tmp_path):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as archive:
+        data = b"hello"
+        info = tarfile.TarInfo("0_note.txt")
+        info.size = len(data)
+        archive.addfile(info, io.BytesIO(data))
+        unsafe = tarfile.TarInfo("../escape.txt")
+        unsafe.size = len(data)
+        archive.addfile(unsafe, io.BytesIO(data))
+
+    detail = {
+        "id": "em_tar",
+        "parsed": {
+            "attachments": [{"filename": "note.txt", "content_type": "text/plain", "size_bytes": 5}]
+        },
+    }
+    monkeypatch.setattr(daemon, "ATTACHMENT_ROOT", tmp_path / "attachments")
+    monkeypatch.setattr(daemon, "primitive_request_bytes", lambda path: buf.getvalue())
+    saved = daemon.primitive_download_attachments(detail)
+    assert len(saved) == 1
+    assert pathlib.Path(saved[0]["path"]).read_text() == "hello"
+    assert not (tmp_path / "escape.txt").exists()
+
+
+def test_primitive_handle_marks_disallowed_sender_processed(monkeypatch):
+    state = {"processed": [], "failures": {}}
+    detail = {
+        "id": "em_bad",
+        "from_email": "mallory@example.com",
+        "subject": "nope",
+        "auth": {"dmarc": "pass"},
+        "parsed": {"attachments": []},
+    }
+    monkeypatch.setattr(daemon, "ALLOWED_FROM", {"alice@example.com"})
+    monkeypatch.setattr(daemon, "dispatch_to_claude_code", lambda *a: (_ for _ in ()).throw(AssertionError))
+    daemon.primitive_handle_email(detail, state)
+    assert state["processed"] == ["em_bad"]
+
+
+def test_primitive_handle_success_marks_processed(monkeypatch):
+    state = {"processed": [], "failures": {}}
+    detail = {
+        "id": "em_ok",
+        "from_email": "alice@example.com",
+        "from_header": "Alice <alice@example.com>",
+        "subject": "go",
+        "body_text": "body",
+        "auth": {"dmarc": "pass"},
+        "parsed": {"attachments": []},
+    }
+    monkeypatch.setattr(daemon, "ALLOWED_FROM", {"alice@example.com"})
+    monkeypatch.setattr(daemon, "primitive_download_attachments", lambda *a: [])
+    monkeypatch.setattr(daemon, "dispatch_to_claude_code", lambda *a: True)
+    daemon.primitive_handle_email(detail, state)
+    assert state["processed"] == ["em_ok"]
