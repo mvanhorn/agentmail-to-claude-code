@@ -72,8 +72,14 @@ CC_HOME.mkdir(parents=True, exist_ok=True)
 CMUX_BIN = os.environ.get(
     "CMUX_BIN", "/Applications/cmux.app/Contents/Resources/bin/cmux"
 )
-# Substring printed in a fresh Claude Code surface once it is ready for input.
-CLAUDE_READY_MARKER = "bypass permissions on"
+# Substrings printed in a fresh Claude Code surface once it is ready for input.
+# The interactive footer always shows "<mode> on (shift+tab to cycle)", so the
+# mode-agnostic "shift+tab to cycle" is the reliable readiness signal. The old
+# "bypass permissions on" only matched the bypass permission mode, so sessions
+# running in auto / plan / accept-edits mode never matched it -- the wait timed
+# out and the prompt was typed before the input box was ready. Kept as a
+# fallback for any build whose footer differs.
+CLAUDE_READY_MARKERS = ("shift+tab to cycle", "bypass permissions on")
 CLAUDE_READY_TIMEOUT_S = int(os.environ.get("CC_READY_TIMEOUT", "25"))
 # surface.create can fail with a transient "Broken pipe" when cmux's control
 # plane is briefly unresponsive (mid-restart, recovering from a crash). Retry a
@@ -441,7 +447,8 @@ def _cmux_open_session() -> str:
     deadline = time.monotonic() + CLAUDE_READY_TIMEOUT_S
     while time.monotonic() < deadline:
         try:
-            if CLAUDE_READY_MARKER in _surface_text(surface_id):
+            surface_text = _surface_text(surface_id)
+            if any(marker in surface_text for marker in CLAUDE_READY_MARKERS):
                 return surface_id
         except subprocess.CalledProcessError:
             pass  # transient read failure; retry until deadline

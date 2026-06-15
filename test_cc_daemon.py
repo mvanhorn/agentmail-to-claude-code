@@ -180,6 +180,18 @@ def test_cmux_open_session_returns_surface_id_when_ready(monkeypatch):
     assert daemon._cmux_open_session() == "SID"
 
 
+def test_cmux_open_session_ready_in_non_bypass_mode(monkeypatch):
+    # Sessions in auto/plan/accept-edits mode show "<mode> on (shift+tab to
+    # cycle)" but never "bypass permissions on". They must still be detected as
+    # ready, otherwise the daemon times out and types into a not-ready surface.
+    monkeypatch.setattr(daemon, "_cmux_rpc", lambda m, p=None: {"surface_id": "SID"})
+    monkeypatch.setattr(
+        daemon, "_surface_text", lambda s: "⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt"
+    )
+    monkeypatch.setattr(daemon.time, "sleep", lambda *_: None)
+    assert daemon._cmux_open_session() == "SID"
+
+
 def test_cmux_open_session_raises_without_id(monkeypatch):
     monkeypatch.setattr(daemon, "_cmux_rpc", lambda m, p=None: {})
     with pytest.raises(RuntimeError):
